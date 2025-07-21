@@ -9,6 +9,7 @@ from pydub import AudioSegment
 
 CHUNK_SIZE = 3000  # số ký tự tối đa mỗi chunk
 
+
 def read_docx(file_path):
     doc = Document(file_path)
     return " ".join([paragraph.text for paragraph in doc.paragraphs])
@@ -19,7 +20,8 @@ def read_pdf(file_path):
     text = ""
     for page in doc:
         blocks = page.get_text("blocks")
-        blocks.sort(key=lambda block: -block[1])
+        # Sắp xếp theo tọa độ Y từ trên xuống dưới (ascending order)
+        blocks.sort(key=lambda block: block[1])  # Bỏ dấu trừ
         for block in blocks:
             text += block[4] + "\n"
     return text
@@ -106,7 +108,10 @@ async def main():
 
         # Cleanup folder nếu bạn muốn
         for path in temp_files:
-            os.remove(path)
+            try:
+                os.remove(path)
+            except Exception:
+                pass
         try:
             os.rmdir(temp_dir)
         except OSError:
