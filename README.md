@@ -48,6 +48,7 @@ pip install -r requirements.txt
 ```
 
 2. Run the script:
+Install Python 3.12
 
 ```
 python main.py
