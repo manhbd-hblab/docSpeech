@@ -34,10 +34,10 @@ This will convert the `my_document.docx` file to the `my_audio.mp3` file using t
 
 **Requirements:**
 
-* Python 3.6 or later
-* fitz
-* docx
-* edge_tts
+```
+pip list
+pip freeze > requirements.txt
+```
 
 **Installation:**
 
