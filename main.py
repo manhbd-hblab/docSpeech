@@ -9,8 +9,23 @@ from pydub import AudioSegment
 from concurrent.futures import ThreadPoolExecutor
 import time
 
-CHUNK_SIZE = 3000  # số ký tự tối đa mỗi chunk
-MAX_CONCURRENT = 8  # số chunk xử lý song song
+CHUNK_SIZE = 2000  # Giảm kích thước chunk để giọng đọc tự nhiên hơn
+MAX_CONCURRENT = 6  # Giảm concurrent để ổn định hơn
+PAUSE_BETWEEN_CHUNKS = 300  # Thêm khoảng lặng 300ms giữa các chunk
+FADE_DURATION = 50  # Fade in/out 50ms cho mượt mà hơn
+
+
+def setup_directories():
+    """Tạo các thư mục cần thiết"""
+    base_dir = os.path.dirname(__file__)
+    input_dir = os.path.join(base_dir, "input")
+    output_dir = os.path.join(base_dir, "output")
+    temp_dir = os.path.join(base_dir, "temp_chunks")
+
+    for directory in [input_dir, output_dir, temp_dir]:
+        os.makedirs(directory, exist_ok=True)
+
+    return input_dir, output_dir, temp_dir
 
 
 def read_docx(file_path):
@@ -23,7 +38,6 @@ def read_pdf(file_path):
     text = ""
     for page in doc:
         blocks = page.get_text("blocks")
-        # FIX: Bỏ dấu trừ để đọc từ trên xuống dưới
         blocks.sort(key=lambda block: (block[1], block[0]))  # Y trước, X sau
         for block in blocks:
             text += block[4] + " "
@@ -31,46 +45,96 @@ def read_pdf(file_path):
     return text
 
 
-def split_text(text, max_length=CHUNK_SIZE):
+def smart_split_text(text, max_length=CHUNK_SIZE):
+    """Chia text thông minh hơn để tránh cắt giữa câu"""
+    # Làm sạch text trước
+    text = re.sub(r"\s+", " ", text.strip())
+
+    # Chia theo câu trước
     sentences = re.split(r"(?<=[.!?])\s+", text)
     chunks = []
-    current = ""
+    current_chunk = ""
+
     for sentence in sentences:
-        if len(current) + len(sentence) + 1 < max_length:
-            current += sentence + " "
+        sentence = sentence.strip()
+        if not sentence:
+            continue
+
+        # Nếu câu quá dài, chia nhỏ hơn theo dấu phay, chấm phẩy
+        if len(sentence) > max_length:
+            sub_parts = re.split(r"(?<=[,;:])\s+", sentence)
+            for part in sub_parts:
+                if len(current_chunk) + len(part) + 2 <= max_length:
+                    current_chunk += part + " "
+                else:
+                    if current_chunk:
+                        chunks.append(current_chunk.strip())
+                    current_chunk = part + " "
         else:
-            chunks.append(current.strip())
-            current = sentence + " "
-    if current:
-        chunks.append(current.strip())
+            # Kiểm tra xem có vừa chunk hiện tại không
+            if len(current_chunk) + len(sentence) + 2 <= max_length:
+                current_chunk += sentence + " "
+            else:
+                if current_chunk:
+                    chunks.append(current_chunk.strip())
+                current_chunk = sentence + " "
+
+    # Thêm chunk cuối
+    if current_chunk:
+        chunks.append(current_chunk.strip())
+
     return chunks
 
 
 def create_arg_parser():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("file_path", help="Path to the document file")
-    parser.add_argument("output_path", help="Path to the output audio file")
+    parser = argparse.ArgumentParser(
+        description="Convert documents to speech with improved quality"
+    )
+    parser.add_argument("file_name", help="Name of the document file in input folder")
     parser.add_argument(
-        "--language", default="vi-VN-HoaiMyNeural", help="Voice for TTS conversion"
+        "--language",
+        default="vi-VN-HoaiMyNeural",
+        help="Voice for TTS conversion (default: vi-VN-HoaiMyNeural)",
     )
     parser.add_argument(
         "--concurrent",
         type=int,
         default=MAX_CONCURRENT,
-        help="Number of concurrent chunks to process (default: 8)",
+        help=f"Number of concurrent chunks to process (default: {MAX_CONCURRENT})",
+    )
+    parser.add_argument(
+        "--speed", default="0%", help="Speech speed (-50% to +50%, default: 0%)"
+    )
+    parser.add_argument(
+        "--pitch", default="+0Hz", help="Speech pitch (-50Hz to +50Hz, default: +0Hz)"
     )
     return parser
 
 
-async def process_chunk(chunk, chunk_index, language, temp_dir):
-    """Xử lý một chunk riêng biệt"""
+async def process_chunk_with_prosody(
+    chunk, chunk_index, language, temp_dir, speed="0%", pitch="+0Hz"
+):
+    """Xử lý chunk với prosody để giọng đọc tự nhiên hơn"""
     temp_path = os.path.join(temp_dir, f"chunk_{chunk_index:04d}.mp3")
 
     try:
-        communicate = edge_tts.Communicate(chunk, language)
+        # Thêm SSML để kiểm soát prosody
+        ssml_text = f"""
+        <speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xml:lang="vi-VN">
+            <voice name="{language}">
+                <prosody rate="{speed}" pitch="{pitch}">
+                    {chunk}
+                </prosody>
+            </voice>
+        </speak>
+        """
+
+        communicate = edge_tts.Communicate(ssml_text, language)
         await communicate.save(temp_path)
 
-        # Kiểm tra file được tạo thành công
+        # Thêm delay nhỏ để tránh rate limit
+        await asyncio.sleep(0.1)
+
         if os.path.exists(temp_path) and os.path.getsize(temp_path) > 0:
             return chunk_index, temp_path, True
         else:
@@ -81,19 +145,36 @@ async def process_chunk(chunk, chunk_index, language, temp_dir):
         return chunk_index, temp_path, False
 
 
-async def process_chunks_batch(chunks, language, temp_dir, max_concurrent):
-    """Xử lý nhiều chunk song song với semaphore để giới hạn concurrent"""
+async def process_chunks_batch(
+    chunks, language, temp_dir, max_concurrent, speed="0%", pitch="+0Hz"
+):
+    """Xử lý batch với retry logic"""
     semaphore = asyncio.Semaphore(max_concurrent)
     completed_chunks = []
 
-    async def process_with_semaphore(chunk, index):
+    async def process_with_semaphore_and_retry(chunk, index, max_retries=2):
         async with semaphore:
-            return await process_chunk(chunk, index, language, temp_dir)
+            for attempt in range(max_retries + 1):
+                try:
+                    result = await process_chunk_with_prosody(
+                        chunk, index, language, temp_dir, speed, pitch
+                    )
+                    if result[2]:  # success
+                        return result
+                    elif attempt < max_retries:
+                        await asyncio.sleep(1 * (attempt + 1))  # exponential backoff
+                except Exception as e:
+                    if attempt < max_retries:
+                        print(f"⚠️ Retry {attempt + 1} for chunk {index + 1}: {e}")
+                        await asyncio.sleep(1 * (attempt + 1))
+                    else:
+                        return index, "", False
+            return index, "", False
 
-    # Tạo tasks cho tất cả chunks
-    tasks = [process_with_semaphore(chunk, i) for i, chunk in enumerate(chunks)]
+    tasks = [
+        process_with_semaphore_and_retry(chunk, i) for i, chunk in enumerate(chunks)
+    ]
 
-    # Xử lý với progress tracking
     results = []
     completed = 0
     total = len(tasks)
@@ -115,79 +196,84 @@ async def process_chunks_batch(chunks, language, temp_dir, max_concurrent):
 
     except KeyboardInterrupt:
         print(f"\n⛔ Interrupted! Completed {len(completed_chunks)}/{total} chunks.")
-        # Vẫn trả về kết quả đã hoàn thành
-        pass
 
-    # Sắp xếp results theo thứ tự chunk index
     results.sort(key=lambda x: x[0])
     completed_chunks.sort(key=lambda x: x[0])
 
     return results, completed_chunks
 
 
-def combine_audio_files(completed_chunks, output_path):
-    """Kết hợp các file audio theo đúng thứ tự"""
+def combine_audio_with_smooth_transitions(completed_chunks, output_path):
+    """Kết hợp audio với transitions mượt mà hơn"""
     if not completed_chunks:
         print("❌ No completed chunks to combine")
         return False
 
-    print(f"🔗 Combining {len(completed_chunks)} audio files in correct order...")
+    print(
+        f"🔗 Combining {len(completed_chunks)} audio files with smooth transitions..."
+    )
     start_time = time.time()
 
     try:
-        # Sắp xếp lại theo chunk index để đảm bảo thứ tự
         completed_chunks.sort(key=lambda x: x[0])
-
-        # Lấy danh sách file paths theo thứ tự
         temp_files = [temp_path for _, temp_path in completed_chunks]
 
-        def load_audio(path):
+        def load_and_process_audio(path):
             try:
                 if os.path.exists(path) and os.path.getsize(path) > 0:
-                    return AudioSegment.from_file(path, format="mp3")
+                    audio = AudioSegment.from_file(path, format="mp3")
+                    # Normalize volume
+                    audio = audio.normalize()
+                    # Thêm fade in/out nhẹ
+                    if len(audio) > FADE_DURATION * 2:
+                        audio = audio.fade_in(FADE_DURATION).fade_out(FADE_DURATION)
+                    return audio
                 else:
-                    print(f"⚠️ Invalid file: {os.path.basename(path)}")
                     return None
             except Exception as e:
                 print(f"⚠️ Error loading {os.path.basename(path)}: {e}")
                 return None
 
-        # Load audio files với threading
-        print("📂 Loading audio segments...")
+        # Load audio segments
+        print("📂 Loading and processing audio segments...")
         with ThreadPoolExecutor(max_workers=4) as executor:
-            audio_segments = list(executor.map(load_audio, temp_files))
+            audio_segments = list(executor.map(load_and_process_audio, temp_files))
 
-        # Lọc và combine theo thứ tự
-        valid_segments = []
-        for i, (segment, (chunk_idx, path)) in enumerate(
-            zip(audio_segments, completed_chunks)
-        ):
-            if segment is not None:
-                valid_segments.append(segment)
-                print(f"  ➕ Chunk {chunk_idx + 1}: {os.path.basename(path)}")
-            else:
-                print(f"  ❌ Skipped chunk {chunk_idx + 1}: {os.path.basename(path)}")
+        # Combine với pause giữa các chunk
+        valid_segments = [seg for seg in audio_segments if seg is not None]
 
         if not valid_segments:
             print("❌ No valid audio segments to combine")
             return False
 
-        # Kết hợp audio theo thứ tự
-        print("🎵 Combining audio segments...")
-        final_audio = AudioSegment.silent(duration=0)
-        for segment in valid_segments:
-            final_audio += segment
+        print("🎵 Combining with smooth transitions...")
+        final_audio = valid_segments[0]
 
-        # Export với tối ưu
+        # Thêm pause nhỏ giữa các chunk để tự nhiên hơn
+        pause = AudioSegment.silent(duration=PAUSE_BETWEEN_CHUNKS)
+
+        for segment in valid_segments[1:]:
+            final_audio += pause + segment
+
+        # Normalize final audio
+        final_audio = final_audio.normalize()
+
+        # Export với chất lượng cao hơn
         print("💾 Exporting final audio...")
         final_audio.export(
-            output_path, format="mp3", bitrate="128k", parameters=["-threads", "4"]
+            output_path,
+            format="mp3",
+            bitrate="192k",  # Tăng bitrate
+            parameters=["-q:a", "0", "-threads", "4"],  # Chất lượng cao nhất
         )
 
         combine_time = time.time() - start_time
-        duration = len(final_audio) / 1000  # seconds
+        duration = len(final_audio) / 1000
+        file_size = os.path.getsize(output_path) / (1024 * 1024)  # MB
+
         print(f"✅ Audio combined in {combine_time:.2f} seconds")
         print(f"🎵 Final audio duration: {duration:.1f} seconds")
+        print(f"📦 File size: {file_size:.1f} MB")
         return True
 
     except Exception as e:
@@ -200,46 +286,65 @@ async def main():
     parser = create_arg_parser()
     args = parser.parse_args()
 
-    print("📖 Reading document...")
-    if args.file_path.endswith(".docx"):
-        text = read_docx(args.file_path)
-    elif args.file_path.endswith(".pdf"):
-        text = read_pdf(args.file_path)
-    else:
-        print("❌ Unsupported file format")
+    # Setup directories
+    input_dir, output_dir, temp_dir = setup_directories()
+
+    # Construct full paths
+    input_path = os.path.join(input_dir, args.file_name)
+    output_filename = os.path.splitext(args.file_name)[0] + ".mp3"
+    output_path = os.path.join(output_dir, output_filename)
+
+    print(f"📁 Input folder: {input_dir}")
+    print(f"📁 Output folder: {output_dir}")
+    print(f"📖 Reading document: {args.file_name}")
+
+    # Check if input file exists
+    if not os.path.exists(input_path):
+        print(f"❌ File not found: {input_path}")
+        print("💡 Please place your document in the 'input' folder")
+        return
+
+    # Read document
+    try:
+        if args.file_name.lower().endswith(".docx"):
+            text = read_docx(input_path)
+        elif args.file_name.lower().endswith(".pdf"):
+            text = read_pdf(input_path)
+        else:
+            print("❌ Unsupported file format. Use .docx or .pdf")
+            return
+    except Exception as e:
+        print(f"❌ Error reading file: {e}")
         return
 
     if not text.strip():
         print("❌ No text found in the document.")
         return
 
-    chunks = split_text(text)
-    print(f"📝 Split into {len(chunks)} chunks")
+    # Smart text splitting
+    chunks = smart_split_text(text, CHUNK_SIZE)
+    print(f"📝 Split into {len(chunks)} chunks (improved splitting)")
     print(f"⚙️ Using {args.concurrent} concurrent processes")
+    print(f"🎵 Voice: {args.language}, Speed: {args.speed}, Pitch: {args.pitch}")
 
-    # In ra vài chunk đầu để kiểm tra thứ tự
-    print(f"📄 First chunk preview: {chunks[0][:100]}..." if chunks else "No chunks")
-
-    # Tạo thư mục temp
-    temp_dir = os.path.join(os.path.dirname(__file__), "temp_chunks")
-    os.makedirs(temp_dir, exist_ok=True)
+    # Preview
+    if chunks:
+        print(f"📄 First chunk preview: {chunks[0][:100]}...")
 
     completed_chunks = []
     all_temp_files = []
 
     try:
-        print("🎵 Starting TTS conversion...")
+        print("🎵 Starting enhanced TTS conversion...")
         tts_start = time.time()
 
-        # Xử lý chunks song song
         results, completed_chunks = await process_chunks_batch(
-            chunks, args.language, temp_dir, args.concurrent
+            chunks, args.language, temp_dir, args.concurrent, args.speed, args.pitch
         )
 
         tts_time = time.time() - tts_start
         print(f"🎵 TTS conversion completed in {tts_time:.2f} seconds")
 
-        # Thu thập tất cả file paths để cleanup
         all_temp_files = [temp_path for _, temp_path, _ in results]
         failed_count = sum(1 for _, _, success in results if not success)
 
@@ -251,13 +356,14 @@ async def main():
         )
 
         if completed_chunks:
-            # Kết hợp audio files theo đúng thứ tự
-            success = combine_audio_files(completed_chunks, args.output_path)
+            success = combine_audio_with_smooth_transitions(
+                completed_chunks, output_path
+            )
 
             if success:
                 total_time = time.time() - start_time
                 print(f"✅ Total conversion time: {total_time:.2f} seconds")
-                print(f"📁 Output saved to {args.output_path}")
+                print(f"📁 Output saved to: {output_path}")
             else:
                 print("❌ Failed to create final audio file")
         else:
@@ -265,14 +371,13 @@ async def main():
 
     except KeyboardInterrupt:
         print("\n⛔ Stopped by user.")
-        # Vẫn cố gắng combine các chunk đã hoàn thành
         if completed_chunks:
             print("🔗 Creating partial audio from completed chunks...")
-            combine_audio_files(completed_chunks, args.output_path)
+            combine_audio_with_smooth_transitions(completed_chunks, output_path)
     except Exception as e:
         print(f"\n❌ Unexpected error: {e}")
     finally:
-        # Cleanup - xóa tất cả temp files
+        # Cleanup
         print("🧹 Cleaning up temporary files...")
         cleanup_start = time.time()
         cleaned_count = 0
@@ -286,7 +391,8 @@ async def main():
                 pass
 
         try:
-            os.rmdir(temp_dir)
+            if os.path.exists(temp_dir) and len(os.listdir(temp_dir)) == 0:
+                os.rmdir(temp_dir)
         except OSError:
             pass
 
