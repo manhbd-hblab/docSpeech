@@ -53,3 +53,7 @@ Install Python 3.12
 ```
 python main.py
 ```
+
+
+**Build:**
+pyinstaller build.spec
